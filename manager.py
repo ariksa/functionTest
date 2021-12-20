@@ -1,6 +1,6 @@
 import logging
 from http import HTTPStatus
-from multiprocessing import Process, Lock as MP_Lock
+from multiprocessing import Process, Pipe, Lock as MP_Lock
 from threading import Thread, Lock as MT_Lock
 
 from flask import Flask, request
@@ -8,21 +8,84 @@ from waitress import serve
 
 from lambda_code import lambda_function
 
+LAMBDA_GRACE_PERIOD_SEC = 50
 FILE_LOCK = MP_Lock()
 FILE_NAME = "lambda_output.txt"
-TOTAL_INVOCATION_LOCK = MT_Lock()
-ACTIVE_INSTANCES = 0
 TOTAL_INVOCATION_COUNT = 0
+TOTAL_INVOCATION_COUNT_LOCK = MT_Lock()
+ACTIVE_INSTANCES = 0
+ACTIVE_INSTANCES_LOCK = MT_Lock()
+PIPE_LIST = list()
 app = Flask("Manager")
 
 
+class PipeList:
+    def __init__(self):
+        pass
+
+
+class ProcessPipes:
+    def __init__(self):
+        self.ack_read_pipe, self.ack_write_pipe = Pipe()
+        self.message_read_pipe, self.message_write_pipe = Pipe()
+
+
 def create_lambda(message):
+    global ACTIVE_INSTANCES_LOCK
+    global ACTIVE_INSTANCES
+    with ACTIVE_INSTANCES_LOCK:
+        ACTIVE_INSTANCES += 1
+
+    global PIPE_LIST
+    if PIPE_LIST:
+        process_pipes = PIPE_LIST.pop()
+        reuse_lambda_once(message, process_pipes)
+    else:
+        process_pipes = spawn_process(message)
+
+    reuse_lambda_loop(process_pipes)
+
+    with ACTIVE_INSTANCES_LOCK:
+        ACTIVE_INSTANCES -= 1
+
+
+def spawn_process(message):
+    process_pipes = ProcessPipes()
+
+    p = Process(target=lambda_function,
+                args=(message, FILE_LOCK, FILE_NAME,
+                      process_pipes.message_read_pipe,
+                      process_pipes.ack_write_pipe,
+                      LAMBDA_GRACE_PERIOD_SEC))
+    p.start()
+    return process_pipes
+
+
+def reuse_lambda_once(message, process_pipes):
     try:
-        p = Process(target=lambda_function, args=(message, FILE_LOCK, FILE_NAME,))
-        p.start()
-        p.join()
+        process_pipes.message_write_pipe.send(message)
     except Exception as e:
-        logging.exception(e)
+        spawn_process(message)
+
+
+def reuse_lambda_loop(process_pipes):
+    logging.debug("Reusing lambda loop")
+
+    global PIPE_LIST
+
+    while True:
+        if process_pipes.ack_read_pipe.poll(LAMBDA_GRACE_PERIOD_SEC * 2):
+            message = process_pipes.ack_read_pipe.recv()
+            if message == "Sleeping":
+                PIPE_LIST.append(process_pipes)
+            else:
+                try:
+                    logging.debug("The process has exited")
+                    PIPE_LIST.remove(process_pipes)
+                except ValueError:
+                    pass
+
+                return
 
 
 def _handle_message(message):
@@ -52,7 +115,9 @@ def post_message():
     message = request.json.get('message')
 
     global TOTAL_INVOCATION_COUNT
-    with TOTAL_INVOCATION_LOCK:
+    global TOTAL_INVOCATION_COUNT_LOCK
+
+    with TOTAL_INVOCATION_COUNT_LOCK:
         TOTAL_INVOCATION_COUNT += 1
 
     return _handle_message(message)
