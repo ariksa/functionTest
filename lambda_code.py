@@ -12,7 +12,7 @@ def lambda_function(message, file_lock, file_name, message_read_pipe, ack_write_
 
 def do_some_work(file_lock, file_name, message):
     sleep(INTERVAL_TO_SLEEP_SEC)
-    logging.debug(f"Writing message {message}")
+    logging.info(f"Writing message {message}")
     with file_lock:
         with open(file_name, 'a') as the_file:
             the_file.write(message + '\n')

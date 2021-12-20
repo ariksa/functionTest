@@ -5,7 +5,7 @@ from manager import start as start_manager
 PORT = 8000
 
 logging.basicConfig(format='%(asctime)s - %(process)d - [%(levelname)s] %(message)s',
-                    level=logging.DEBUG,
+                    level=logging.INFO,
                     datefmt='%Y-%m-%d %H:%M:%S')
 
 

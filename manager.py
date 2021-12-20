@@ -1,40 +1,26 @@
 import logging
 from http import HTTPStatus
-from multiprocessing import Process, Pipe, Lock as MP_Lock
-from threading import Thread, Lock as MT_Lock
+from multiprocessing import Process, Lock as MP_Lock
+from threading import Thread
 
 from flask import Flask, request
 from waitress import serve
 
 from lambda_code import lambda_function
+from pipes import ProcessPipes
+from stats import Stats
 
-LAMBDA_GRACE_PERIOD_SEC = 50
+LAMBDA_GRACE_PERIOD_SEC = 5
 FILE_LOCK = MP_Lock()
 FILE_NAME = "lambda_output.txt"
-TOTAL_INVOCATION_COUNT = 0
-TOTAL_INVOCATION_COUNT_LOCK = MT_Lock()
-ACTIVE_INSTANCES = 0
-ACTIVE_INSTANCES_LOCK = MT_Lock()
+PROCESS_PIPES = ProcessPipes()
 PIPE_LIST = list()
+STATS = Stats()
 app = Flask("Manager")
 
 
-class PipeList:
-    def __init__(self):
-        pass
-
-
-class ProcessPipes:
-    def __init__(self):
-        self.ack_read_pipe, self.ack_write_pipe = Pipe()
-        self.message_read_pipe, self.message_write_pipe = Pipe()
-
-
 def create_lambda(message):
-    global ACTIVE_INSTANCES_LOCK
-    global ACTIVE_INSTANCES
-    with ACTIVE_INSTANCES_LOCK:
-        ACTIVE_INSTANCES += 1
+    STATS.increase_active_instances()
 
     global PIPE_LIST
     if PIPE_LIST:
@@ -44,9 +30,6 @@ def create_lambda(message):
         process_pipes = spawn_process(message)
 
     reuse_lambda_loop(process_pipes)
-
-    with ACTIVE_INSTANCES_LOCK:
-        ACTIVE_INSTANCES -= 1
 
 
 def spawn_process(message):
@@ -63,6 +46,7 @@ def spawn_process(message):
 
 def reuse_lambda_once(message, process_pipes):
     try:
+        logging.debug("Reusing lambda once")
         process_pipes.message_write_pipe.send(message)
     except Exception as e:
         spawn_process(message)
@@ -74,9 +58,12 @@ def reuse_lambda_loop(process_pipes):
     global PIPE_LIST
 
     while True:
+        # Get a message from the process
         if process_pipes.ack_read_pipe.poll(LAMBDA_GRACE_PERIOD_SEC * 2):
             message = process_pipes.ack_read_pipe.recv()
             if message == "Sleeping":
+                # We can reuse the process while it sleeps
+                STATS.decrease_active_instances()
                 PIPE_LIST.append(process_pipes)
             else:
                 try:
@@ -114,11 +101,7 @@ def post_message():
     logging.debug("POST messages")
     message = request.json.get('message')
 
-    global TOTAL_INVOCATION_COUNT
-    global TOTAL_INVOCATION_COUNT_LOCK
-
-    with TOTAL_INVOCATION_COUNT_LOCK:
-        TOTAL_INVOCATION_COUNT += 1
+    STATS.increase_invocation_count()
 
     return _handle_message(message)
 
@@ -127,8 +110,6 @@ def post_message():
 def get_statistics():
     logging.debug("GET statistics")
 
-    global TOTAL_INVOCATION_COUNT
-    global ACTIVE_INSTANCES
-    data = {'active_instances': ACTIVE_INSTANCES,
-            'total_invocation': TOTAL_INVOCATION_COUNT}
+    data = {'active_instances': STATS.get_active_instance(),
+            'total_invocation': STATS.get_invocation_count()}
     return data, HTTPStatus.OK
